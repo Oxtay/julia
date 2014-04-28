@@ -1824,7 +1824,7 @@ function without_linenums(a::Array{Any,1})
     l
 end
 
-const _pure_builtins = {tuple, tupleref, tuplelen, fieldtype, apply_type, is, isa, typeof} # known affect-free calls (also effect-free)
+const _pure_builtins = {tuple, tupleref, tuplelen, fieldtype, apply_type, is, isa, typeof, typeassert} # known affect-free calls (also effect-free)
 const _pure_builtins_volatile = {getfield, arrayref} # known effect-free calls (might not be affect-free)
 
 function is_pure_builtin(f)
@@ -2010,7 +2010,8 @@ function inlineable(f, e::Expr, atypes, sv, enclosing_ast)
     # subset of the method signature.
     if !(atypes <: meth[1])
         return NF
-    end
+    end #jwn: delete me
+
     if !isa(linfo,LambdaStaticData) || meth[3].func.env !== ()
         return NF
     end
@@ -2129,10 +2130,29 @@ function inlineable(f, e::Expr, atypes, sv, enclosing_ast)
     # see if each argument occurs only once in the body expression
     stmts = {}
     stmts_free = true # true = all entries of stmts are effect_free
+
+    if length(args) > 0
+        vargt = meth[1][end]
+        if isvarargtype(vargt)
+            vargt = (vargt::Vararg).parameters[1]
+        end
+    else
+        vargt = Any
+    end
     for i=length(args):-1:1 # stmts_free needs to be calculated in reverse-argument order
         a = args[i]
         aei = argexprs[i]
         aeitype = exprtype(aei)
+        if i < length(meth[1])
+            methitype = meth[1][i]
+        else
+            methitype = vargt
+        end
+        needtypeassert = false
+        if !(aeitype <: methitype)
+            needtypeassert = true
+            aietype = methitype
+        end
 
         islocal = false # if the argument name is also used as a local variable,
                         # we need to keep it as a variable name
@@ -2151,7 +2171,7 @@ function inlineable(f, e::Expr, atypes, sv, enclosing_ast)
         # ok for argument to occur more than once if the actual argument
         # is a symbol or constant, or is not affected by previous statements
         # that will exist after the inlining pass finishes
-        affect_free = stmts_free && !islocal # false = previous statements might affect the result of evaluating argument
+        affect_free = stmts_free && !islocal && !needtypeassert # false = previous statements might affect the result of evaluating argument
         occ = 0
         for j = length(body.args):-1:1
             b = body.args[j]
@@ -2167,14 +2187,21 @@ function inlineable(f, e::Expr, atypes, sv, enclosing_ast)
             end
         end
         free = effect_free(aei,sv,true)
-        if ((occ==0 && is(aeitype,None)) || islocal || (occ > 1 && !inline_worthy(aei, occ)) ||
+        if ((occ==0 && is(aeitype,None)) || islocal || needtypeassert || (occ > 1 && !inline_worthy(aei, occ)) ||
                 (affect_free && !free) || (!affect_free && !effect_free(aei,sv,false)))
-            if occ != 0 # islocal=true is implied
+            if occ != 0 || needtypeassert # islocal=true is implied
                 # introduce variable for this argument
                 vnew = unique_name(enclosing_ast, ast)
                 add_variable(enclosing_ast, vnew, aeitype, !islocal)
-                unshift!(stmts, Expr(:(=), vnew, aei))
                 argexprs[i] = aeitype===Any ? vnew : SymbolNode(vnew,aeitype)
+                if needtypeassert
+                    vnew2 = unique_name(enclosing_ast, ast)
+                    add_variable(enclosing_ast, vnew2, Any, true)
+                    push!(stmts, Expr(:(=), vnew, Expr(:call, TopNode(:typeassert), vnew2, aietype)))
+                else
+                    vnew2 = vnew
+                end
+                unshift!(stmts, Expr(:(=), vnew2, aei))
                 stmts_free &= free
             elseif !free && !isType(aeitype)
                 unshift!(stmts, aei)
